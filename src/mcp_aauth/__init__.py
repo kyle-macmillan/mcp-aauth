@@ -1,3 +1,4 @@
+from .middleware import DualAuthMiddleware, MiddlewareFactory, dual_authentication
 from .routing import (
     CredentialRoute,
     CredentialRoutingError,
@@ -7,5 +8,8 @@ from .routing import (
 __all__ = [
     "CredentialRoute",
     "CredentialRoutingError",
+    "DualAuthMiddleware",
+    "MiddlewareFactory",
     "classify_credentials",
+    "dual_authentication",
 ]
