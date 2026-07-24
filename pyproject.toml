@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-aauth"
+version = "0.1.0"
+description = "AAuth authentication integration for the MCP Python SDK"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_aauth"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
