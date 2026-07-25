@@ -9,6 +9,7 @@ from .routing import (
     CredentialRoutingError,
     classify_credentials,
 )
+from .verification import verify_aauth_agent
 
 __all__ = [
     "ASGIRequestError",
@@ -20,4 +21,5 @@ __all__ = [
     "aauth_request_from_scope",
     "classify_credentials",
     "dual_authentication",
+    "verify_aauth_agent",
 ]
