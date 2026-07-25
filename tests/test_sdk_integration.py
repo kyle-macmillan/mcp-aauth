@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 
 import httpx2
 import pytest
 from aauth_edocs import (
-    HttpRequest,
     SigningKey,
     issue_agent_token,
-    sign,
     static_resolver,
 )
 from mcp import Client
@@ -24,7 +22,11 @@ from mcp.server.mcpserver import Context
 from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from mcp_aauth import aauth_agent_authentication, dual_authentication
+from mcp_aauth import (
+    AAuthAgentHTTPAuth,
+    aauth_agent_authentication,
+    dual_authentication,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -32,22 +34,6 @@ pytestmark = pytest.mark.anyio
 class RejectingTokenVerifier:
     async def verify_token(self, token: str) -> AccessToken | None:
         raise AssertionError("the built-in bearer verifier must not run")
-
-
-class AAuthRequestSigner(httpx2.Auth):
-    def __init__(self, key: SigningKey, token: str) -> None:
-        self.key = key
-        self.token = token
-
-    def auth_flow(self, request: httpx2.Request) -> Iterator[httpx2.Request]:
-        signed = sign(
-            HttpRequest(request.method, str(request.url)),
-            self.key,
-            self.token,
-        )
-        for name in ("Signature-Key", "Signature-Input", "Signature"):
-            request.headers[name] = signed.headers[name]
-        yield request
 
 
 def recording_authentication(
@@ -187,7 +173,7 @@ async def test_signed_agent_reaches_mcp_tool_with_verified_identity() -> None:
             httpx2.AsyncClient(
                 transport=transport,
                 base_url=url,
-                auth=AAuthRequestSigner(agent_key, agent_token),
+                auth=AAuthAgentHTTPAuth(key=agent_key, token=agent_token),
             ) as http_client,
             Client(
                 streamable_http_client(url, http_client=http_client),

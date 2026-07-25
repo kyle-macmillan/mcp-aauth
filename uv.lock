@@ -466,12 +466,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aauth-edocs" },
+    { name = "httpx2" },
     { name = "starlette" },
 ]
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx2" },
     { name = "mcp" },
     { name = "mcp-types" },
     { name = "pytest" },
@@ -481,12 +481,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aauth-edocs", editable = "../aauth" },
+    { name = "httpx2", specifier = ">=2.5.0" },
     { name = "starlette", specifier = ">=0.27" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx2", specifier = ">=2.5.0" },
     { name = "mcp", editable = "../python-sdk" },
     { name = "mcp-types", editable = "../python-sdk/src/mcp-types" },
     { name = "pytest", specifier = ">=8.0" },

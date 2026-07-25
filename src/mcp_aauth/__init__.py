@@ -1,3 +1,4 @@
+from .client import AAuthAgentHTTPAuth
 from .middleware import DualAuthMiddleware, MiddlewareFactory, dual_authentication
 from .request import (
     ASGIRequestError,
@@ -17,6 +18,7 @@ from .verification import (
 
 __all__ = [
     "AAuthAgentMiddleware",
+    "AAuthAgentHTTPAuth",
     "ASGIRequestError",
     "ASGIRequestErrorCode",
     "CredentialRoute",
