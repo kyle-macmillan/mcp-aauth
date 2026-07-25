@@ -1,17 +1,30 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 import httpx2
 import pytest
+from aauth_edocs import (
+    HttpRequest,
+    SigningKey,
+    issue_agent_token,
+    sign,
+    static_resolver,
+)
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.bearer_auth import (
+    BearerAuthBackend,
+    RequireAuthMiddleware,
+)
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.mcpserver import Context
+from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from mcp_aauth import dual_authentication
+from mcp_aauth import aauth_agent_authentication, dual_authentication
 
 pytestmark = pytest.mark.anyio
 
@@ -19,6 +32,22 @@ pytestmark = pytest.mark.anyio
 class RejectingTokenVerifier:
     async def verify_token(self, token: str) -> AccessToken | None:
         raise AssertionError("the built-in bearer verifier must not run")
+
+
+class AAuthRequestSigner(httpx2.Auth):
+    def __init__(self, key: SigningKey, token: str) -> None:
+        self.key = key
+        self.token = token
+
+    def auth_flow(self, request: httpx2.Request) -> Iterator[httpx2.Request]:
+        signed = sign(
+            HttpRequest(request.method, str(request.url)),
+            self.key,
+            self.token,
+        )
+        for name in ("Signature-Key", "Signature-Input", "Signature"):
+            request.headers[name] = signed.headers[name]
+        yield request
 
 
 def recording_authentication(
@@ -111,6 +140,63 @@ async def test_invalid_credential_selection_stops_before_mcp(
 
     assert response.status_code == expected_status
     assert calls == []
+
+
+async def test_signed_agent_reaches_mcp_tool_with_verified_identity() -> None:
+    ap = "https://ap.example"
+    ps = "https://ps.example"
+    agent = "assistant@ap.example"
+    ap_key = SigningKey.generate(kid="ap-1")
+    agent_key = SigningKey.generate(kid="agent-1")
+    resolver = static_resolver({ap: ap_key.public_jwk})
+    agent_token = issue_agent_token(
+        issuer=ap,
+        agent=agent,
+        agent_jwk=agent_key.public_jwk,
+        key=ap_key,
+        ps=ps,
+    )
+
+    server = MCPServer("aauth")
+
+    @server.tool()
+    def authenticated_agent(ctx: Context) -> str:
+        request = ctx.request_context.request
+        return request.scope["aauth"].claims["sub"]
+
+    def oauth_authentication(app: ASGIApp) -> ASGIApp:
+        required = RequireAuthMiddleware(app, required_scopes=[])
+        return AuthenticationMiddleware(
+            required,
+            backend=BearerAuthBackend(RejectingTokenVerifier()),
+        )
+
+    app = server.streamable_http_app(
+        authentication_middleware_factory=dual_authentication(
+            oauth_authentication=oauth_authentication,
+            aauth_authentication=aauth_agent_authentication(
+                key_resolver=resolver,
+            ),
+        ),
+    )
+    url = "http://127.0.0.1:8000/mcp"
+    transport = httpx2.ASGITransport(app=app)
+
+    async with server.session_manager.run():
+        async with (
+            httpx2.AsyncClient(
+                transport=transport,
+                base_url=url,
+                auth=AAuthRequestSigner(agent_key, agent_token),
+            ) as http_client,
+            Client(
+                streamable_http_client(url, http_client=http_client),
+                mode="legacy",
+            ) as client,
+        ):
+            result = await client.call_tool("authenticated_agent", {})
+
+    assert result.content[0].text == agent
 
 
 async def test_oauth_metadata_remains_outside_custom_authentication() -> None:
