@@ -9,9 +9,14 @@ from .routing import (
     CredentialRoutingError,
     classify_credentials,
 )
-from .verification import verify_aauth_agent
+from .verification import (
+    AAuthAgentMiddleware,
+    aauth_agent_authentication,
+    verify_aauth_agent,
+)
 
 __all__ = [
+    "AAuthAgentMiddleware",
     "ASGIRequestError",
     "ASGIRequestErrorCode",
     "CredentialRoute",
@@ -19,6 +24,7 @@ __all__ = [
     "DualAuthMiddleware",
     "MiddlewareFactory",
     "aauth_request_from_scope",
+    "aauth_agent_authentication",
     "classify_credentials",
     "dual_authentication",
     "verify_aauth_agent",
