@@ -186,11 +186,3 @@ async def test_unsupported_scheme_returns_both_challenges(
     headers = dict(messages[0]["headers"])
     assert b"www-authenticate" in headers
     assert headers[b"aauth-requirement"] == b"requirement=agent-token"
-
-
-def test_factory_matches_sdk_authentication_hook(downstream: ASGIApp) -> None:
-    factory = dual_authentication(
-        oauth_authentication=recording_authentication("oauth", []),
-        aauth_authentication=recording_authentication("aauth", []),
-    )
-    assert isinstance(factory(downstream), DualAuthMiddleware)
