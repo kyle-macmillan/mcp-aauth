@@ -11,9 +11,13 @@ import pytest
 from flask import Flask
 
 from aauth_edocs import (
+    AGENT_TYP,
     AAuthError,
+    AuthorizationCoordinator,
     ControllerPolicy,
     Dataflow,
+    EdocsApprovalHandler,
+    EdocsConsentClient,
     ExactRule,
     FunctionDescriptor,
     HttpRequest,
@@ -22,17 +26,20 @@ from aauth_edocs import (
     SigningKey,
     VerifiedRequest,
     build_metadata,
+    build_requirement,
     create_sentinel,
     issue_agent_token,
     issue_auth_token,
     issue_conditional_auth_token,
     issue_resource_token,
+    peek_jwt,
     sign,
     static_resolver,
 )
 from aauth_edocs.agent import TransportResponse
 from aauth_edocs.asrv import create_as
 from aauth_edocs.errors import DENIED, INVALID_REQUEST, INVALID_TOKEN
+from aauth_edocs.headers import AUTH_TOKEN
 from aauth_edocs.httpsig import KeyResolver
 from aauth_edocs.keys import jwk_thumbprint
 from aauth_edocs.ids import DWK_ACCESS
@@ -130,18 +137,49 @@ class DemoApplication:
         mcp_app: ASGIApp,
         *,
         key_resolver: KeyResolver,
+        challenge_mcp: bool = False,
     ) -> None:
         self.resource = resource
         self.mcp_app = mcp_app
+        self.challenge_mcp = challenge_mcp
         self.proposal_app = aauth_agent_authentication(
             key_resolver=key_resolver
         )(self._proposal)
+        self.challenge_app = aauth_agent_authentication(
+            key_resolver=key_resolver
+        )(self._challenge)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("path") == "/resource-token":
             await self.proposal_app(scope, receive, send)
             return
+        if (
+            self.challenge_mcp
+            and scope["type"] == "http"
+            and scope.get("path") == "/mcp"
+            and _presented_token_type(scope) == AGENT_TYP
+        ):
+            await self.challenge_app(scope, receive, send)
+            return
         await self.mcp_app(scope, receive, send)
+
+    async def _challenge(self, scope: Scope, receive: Receive, send: Send) -> None:
+        token = self.resource.proposed_dataflow_token(
+            scope["aauth"],
+            scope=FUNCTION,
+            edoc_id=EDOC_ID,
+        )
+        await send_json(
+            send,
+            401,
+            AAuthError(INVALID_TOKEN, 401, "authorization token required").body(),
+            headers={
+                "AAuth-Requirement": build_requirement(
+                    AUTH_TOKEN,
+                    resource_token=token,
+                )
+            },
+        )
 
     async def _proposal(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("method") != "POST":
@@ -187,16 +225,43 @@ async def read_json(receive: Receive) -> dict:
     return value
 
 
-async def send_json(send: Send, status: int, value: dict) -> None:
+def _presented_token_type(scope: Scope) -> str | None:
+    for name, value in scope.get("headers", []):
+        if name.lower() != b"signature-key":
+            continue
+        signature_key = value.decode("latin-1")
+        marker = 'jwt="'
+        if marker not in signature_key:
+            return None
+        token = signature_key.split(marker, 1)[1].split('"', 1)[0]
+        try:
+            return peek_jwt(token)[0].get("typ")
+        except AAuthError:
+            return None
+    return None
+
+
+async def send_json(
+    send: Send,
+    status: int,
+    value: dict,
+    *,
+    headers: dict[str, str] | None = None,
+) -> None:
     body = json.dumps(value, separators=(",", ":")).encode()
+    raw_headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode()),
+    ]
+    raw_headers.extend(
+        (name.encode(), header_value.encode())
+        for name, header_value in (headers or {}).items()
+    )
     await send(
         {
             "type": "http.response.start",
             "status": status,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-            ],
+            "headers": raw_headers,
         }
     )
     await send({"type": "http.response.body", "body": body})
@@ -459,6 +524,7 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
         return resource.identity(authorization, edoc_id=edoc_id)["message"]
 
     mcp_app = server.streamable_http_app(
+        host="resource.local",
         authentication_middleware_factory=aauth_authorization(
             key_resolver=resolver,
             issuer=SENTINEL,
@@ -469,40 +535,39 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
         resource,
         mcp_app,
         key_resolver=resolver,
+        challenge_mcp=True,
     )
-    token_response = await proposed_resource_token_http(
-        resource, resolver, keys, agent_token, mcp_app
+    coordinator = AuthorizationCoordinator(
+        key=keys["agent"],
+        agent_token=agent_token,
+        transport=transport,
     )
-    assert token_response.status_code == 200
-    resource_token = token_response.json()["resource_token"]
+    consent = EdocsConsentClient(transport)
+    approvals = []
 
-    pending = request_ps_authorization(
-        transport, keys, agent_token, resource_token
-    )
-    assert pending.status_code == 202
     assert transport.request(
         "POST",
         f"{PS}/login",
         json={"person": "alice"},
     ).status_code == 200
-    pid = urlsplit(pending.headers["Location"]).path.rsplit("/", 1)[-1]
-    review = transport.get(f"{PS}/consent/{pid}")
-    assert review.status_code == 200
-    assert review.json()["agent"] == AGENT
-    assert review.json()["resource"] == RESOURCE
-    assert review.json()["audience"] == SENTINEL
-    assert review.json()["scope"] == FUNCTION
-    assert review.json()["claims"]["source_agent"] == SOURCE
-    assert review.json()["claims"]["edoc_id"] == EDOC_ID
-    assert review.json()["claims"]["controllers"] == [AS_A, AS_B]
-    approved = approve(transport, pending.headers["Location"])
-    assert approved.status_code == 200
 
-    final = transport.get(pending.headers["Location"])
-    assert final.status_code == 200
-    auth_token = final.json()["auth_token"]
+    def prompt(review):
+        approvals.append(review)
+        assert review.destination_agent == AGENT
+        assert review.resource == RESOURCE
+        assert review.authorization_audience == SENTINEL
+        assert review.function_id == FUNCTION
+        assert review.source_agent == SOURCE
+        assert review.edoc_id == EDOC_ID
+        assert review.controllers == (AS_A, AS_B)
+        return "grant"
 
-    url = "http://127.0.0.1:8000/mcp"
+    approval_handler = EdocsApprovalHandler(
+        consent_client=consent,
+        prompt=prompt,
+    )
+
+    url = f"{RESOURCE}/mcp"
     asgi_transport = httpx2.ASGITransport(app=app)
 
     async with server.session_manager.run():
@@ -510,7 +575,12 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
             httpx2.AsyncClient(
                 transport=asgi_transport,
                 base_url=url,
-                auth=AAuthAgentHTTPAuth(key=keys["agent"], token=auth_token),
+                auth=AAuthAgentHTTPAuth(
+                    key=keys["agent"],
+                    token=agent_token,
+                    coordinator=coordinator,
+                    on_approval_required=approval_handler,
+                ),
             ) as http_client,
             Client(
                 streamable_http_client(url, http_client=http_client),
@@ -520,6 +590,8 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
             result = await client.call_tool("identity", {"edoc_id": EDOC_ID})
 
     assert result.content[0].text == "hello"
+    assert len(approvals) == 1
+    assert coordinator.token_for(url) is not None
     assert proposal in registry.materialized
 
 
