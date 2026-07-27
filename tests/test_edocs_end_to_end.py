@@ -480,6 +480,21 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
         transport, keys, agent_token, resource_token
     )
     assert pending.status_code == 202
+    assert transport.request(
+        "POST",
+        f"{PS}/login",
+        json={"person": "alice"},
+    ).status_code == 200
+    pid = urlsplit(pending.headers["Location"]).path.rsplit("/", 1)[-1]
+    review = transport.get(f"{PS}/consent/{pid}")
+    assert review.status_code == 200
+    assert review.json()["agent"] == AGENT
+    assert review.json()["resource"] == RESOURCE
+    assert review.json()["audience"] == SENTINEL
+    assert review.json()["scope"] == FUNCTION
+    assert review.json()["claims"]["source_agent"] == SOURCE
+    assert review.json()["claims"]["edoc_id"] == EDOC_ID
+    assert review.json()["claims"]["controllers"] == [AS_A, AS_B]
     approved = approve(transport, pending.headers["Location"])
     assert approved.status_code == 200
 
