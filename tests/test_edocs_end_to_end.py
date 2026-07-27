@@ -28,13 +28,12 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
-from starlette.types import Scope
 
 from mcp_aauth import (
     AAuthAgentHTTPAuth,
     EdocsResource,
+    EdocsResourceApplication,
     aauth_authorization,
-    verify_aauth_agent,
 )
 
 AP = "http://ap.local"
@@ -88,27 +87,6 @@ def metadata_app(issuer: str, dwk: str, key: SigningKey) -> Flask:
         return {"keys": [key.public_jwk]}
 
     return app
-
-
-def asgi_scope(request: HttpRequest) -> Scope:
-    parts = urlsplit(request.url)
-    return {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": request.method,
-        "scheme": parts.scheme,
-        "path": parts.path,
-        "raw_path": parts.path.encode(),
-        "query_string": parts.query.encode(),
-        "root_path": "",
-        "headers": [
-            (name.encode("ascii"), value.encode("latin-1"))
-            for name, value in request.headers.raw_items()
-        ],
-        "server": (parts.hostname, parts.port or 80),
-        "client": ("127.0.0.1", 1234),
-    }
 
 
 def world(*, conditional: bool = False):
@@ -208,18 +186,23 @@ def world(*, conditional: bool = False):
     return transport, keys, registry, proposal, resource, resolver, agent_token
 
 
-def proposed_resource_token(resource, resolver, keys, agent_token):
-    request = sign(
-        HttpRequest("POST", f"{RESOURCE}/authorize", {"host": "resource.local"}),
-        keys["agent"],
-        agent_token,
+async def proposed_resource_token_http(
+    resource, resolver, keys, agent_token, downstream, body=None
+):
+    app = EdocsResourceApplication(
+        resource,
+        downstream,
+        key_resolver=resolver,
     )
-    verified_agent = verify_aauth_agent(asgi_scope(request), resolver)
-    return resource.authorize(
-        verified_agent,
-        scope=FUNCTION,
-        edoc_id=EDOC_ID,
-    )
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app),
+        base_url="http://127.0.0.1:8000",
+        auth=AAuthAgentHTTPAuth(key=keys["agent"], token=agent_token),
+    ) as client:
+        return await client.post(
+            "/resource-token",
+            json=body or {"scope": FUNCTION, "edoc_id": EDOC_ID},
+        )
 
 
 def request_ps_authorization(transport, keys, agent_token, resource_token):
@@ -249,18 +232,6 @@ def approve(transport, pending_url):
 @pytest.mark.anyio
 async def test_full_aauth_edocs_mcp_authorization_flow():
     transport, keys, registry, proposal, resource, resolver, agent_token = world()
-    resource_token = proposed_resource_token(resource, resolver, keys, agent_token)
-
-    pending = request_ps_authorization(
-        transport, keys, agent_token, resource_token
-    )
-    assert pending.status_code == 202
-    approved = approve(transport, pending.headers["Location"])
-    assert approved.status_code == 200
-
-    final = transport.get(pending.headers["Location"])
-    assert final.status_code == 200
-    auth_token = final.json()["auth_token"]
 
     server = MCPServer("edocs-demo")
 
@@ -273,13 +244,35 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
             destination_agent=authorization.claims["agent"],
         )["message"]
 
-    app = server.streamable_http_app(
+    mcp_app = server.streamable_http_app(
         authentication_middleware_factory=aauth_authorization(
             key_resolver=resolver,
             issuer=SENTINEL,
             audience=RESOURCE,
         )
     )
+    app = EdocsResourceApplication(
+        resource,
+        mcp_app,
+        key_resolver=resolver,
+    )
+    token_response = await proposed_resource_token_http(
+        resource, resolver, keys, agent_token, mcp_app
+    )
+    assert token_response.status_code == 200
+    resource_token = token_response.json()["resource_token"]
+
+    pending = request_ps_authorization(
+        transport, keys, agent_token, resource_token
+    )
+    assert pending.status_code == 202
+    approved = approve(transport, pending.headers["Location"])
+    assert approved.status_code == 200
+
+    final = transport.get(pending.headers["Location"])
+    assert final.status_code == 200
+    auth_token = final.json()["auth_token"]
+
     url = "http://127.0.0.1:8000/mcp"
     asgi_transport = httpx2.ASGITransport(app=app)
 
@@ -301,11 +294,19 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
     assert proposal in registry.materialized
 
 
-def test_missing_controller_prerequisite_denies_before_mcp():
+@pytest.mark.anyio
+async def test_missing_controller_prerequisite_denies_before_mcp():
     transport, keys, registry, proposal, resource, resolver, agent_token = world(
         conditional=True
     )
-    resource_token = proposed_resource_token(resource, resolver, keys, agent_token)
+    async def downstream(scope, receive, send):
+        raise AssertionError("MCP app should not be called")
+
+    token_response = await proposed_resource_token_http(
+        resource, resolver, keys, agent_token, downstream
+    )
+    assert token_response.status_code == 200
+    resource_token = token_response.json()["resource_token"]
     pending = request_ps_authorization(
         transport, keys, agent_token, resource_token
     )
@@ -315,3 +316,58 @@ def test_missing_controller_prerequisite_denies_before_mcp():
     assert denied.status_code == 403
     assert denied.json()["error"] == "denied"
     assert proposal not in registry.materialized
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("body", "status"),
+    [
+        ({"scope": "unknown@1", "edoc_id": EDOC_ID}, 403),
+        ({"scope": FUNCTION, "edoc_id": "missing"}, 403),
+        ({"scope": f"{FUNCTION} other@1", "edoc_id": EDOC_ID}, 400),
+        (
+            {
+                "scope": FUNCTION,
+                "edoc_id": EDOC_ID,
+                "source_agent": "client-controlled",
+            },
+            400,
+        ),
+    ],
+)
+async def test_resource_token_endpoint_rejects_invalid_proposals(body, status):
+    _, keys, _, _, resource, resolver, agent_token = world()
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("MCP app should not be called")
+
+    response = await proposed_resource_token_http(
+        resource, resolver, keys, agent_token, downstream, body
+    )
+
+    assert response.status_code == status
+
+
+@pytest.mark.anyio
+async def test_resource_token_endpoint_requires_signed_agent_request():
+    _, _, _, _, resource, resolver, _ = world()
+
+    async def downstream(scope, receive, send):
+        raise AssertionError("MCP app should not be called")
+
+    app = EdocsResourceApplication(
+        resource,
+        downstream,
+        key_resolver=resolver,
+    )
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app),
+        base_url="http://127.0.0.1:8000",
+    ) as client:
+        response = await client.post(
+            "/resource-token",
+            json={"scope": FUNCTION, "edoc_id": EDOC_ID},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"] == "invalid_signature"

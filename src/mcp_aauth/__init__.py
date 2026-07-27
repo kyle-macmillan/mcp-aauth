@@ -1,5 +1,5 @@
 from .client import AAuthAgentHTTPAuth
-from .edocs_resource import EdocsResource
+from .edocs_resource import EdocsResource, EdocsResourceApplication
 from .middleware import DualAuthMiddleware, MiddlewareFactory, dual_authentication
 from .request import (
     ASGIRequestError,
@@ -30,6 +30,7 @@ __all__ = [
     "CredentialRoutingError",
     "DualAuthMiddleware",
     "EdocsResource",
+    "EdocsResourceApplication",
     "MiddlewareFactory",
     "aauth_request_from_scope",
     "aauth_agent_authentication",
