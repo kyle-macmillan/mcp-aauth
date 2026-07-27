@@ -24,6 +24,8 @@ from aauth_edocs import (
     build_metadata,
     create_sentinel,
     issue_agent_token,
+    issue_auth_token,
+    issue_conditional_auth_token,
     issue_resource_token,
     sign,
     static_resolver,
@@ -33,6 +35,7 @@ from aauth_edocs.asrv import create_as
 from aauth_edocs.errors import DENIED, INVALID_REQUEST, INVALID_TOKEN
 from aauth_edocs.httpsig import KeyResolver
 from aauth_edocs.keys import jwk_thumbprint
+from aauth_edocs.ids import DWK_ACCESS
 from aauth_edocs.ps import create_ps
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
@@ -65,6 +68,7 @@ class DemoResource:
     issuer: str
     sentinel: str
     source_agent: str
+    destination_agent: str
     key: SigningKey
     controllers: tuple[str, ...]
     documents: Mapping[str, Any]
@@ -102,6 +106,7 @@ class DemoResource:
             "source_agent": self.source_agent,
             "scope": FUNCTION,
             "edoc_id": edoc_id,
+            "agent": self.destination_agent,
             "controllers": list(self.controllers),
         }
         for name, value in expected.items():
@@ -321,6 +326,7 @@ def world(*, conditional: bool = False):
         issuer=RESOURCE,
         sentinel=SENTINEL,
         source_agent=SOURCE,
+        destination_agent=AGENT,
         key=keys["resource"],
         controllers=(AS_A, AS_B),
         documents={EDOC_ID: {"message": "hello"}},
@@ -330,6 +336,8 @@ def world(*, conditional: bool = False):
         {
             AP: keys["ap"].public_jwk,
             SENTINEL: keys["sentinel"].public_jwk,
+            AS_A: keys["as-a"].public_jwk,
+            AS_B: keys["as-b"].public_jwk,
         }
     )
     return transport, keys, registry, proposal, resource, resolver, agent_token
@@ -376,6 +384,67 @@ def approve(transport, pending_url):
         f"{PS}/consent/{pid}",
         json={"decision": "grant"},
     )
+
+
+def final_token(keys, **changes):
+    values = {
+        "issuer": SENTINEL,
+        "dwk": DWK_ACCESS,
+        "aud": RESOURCE,
+        "agent": AGENT,
+        "cnf_jwk": keys["agent"].public_jwk,
+        "scope": FUNCTION,
+        "source_agent": SOURCE,
+        "edoc_id": EDOC_ID,
+        "controllers": (AS_A, AS_B),
+        "key": keys["sentinel"],
+    }
+    values.update(changes)
+    return issue_auth_token(**values)
+
+
+async def invoke_identity(resource, resolver, signing_key, token, *, edoc_id=EDOC_ID):
+    executions = {"count": 0}
+    server = MCPServer("edocs-negative")
+
+    @server.tool()
+    def identity(requested_edoc_id: str, ctx: Context) -> str:
+        authorization = ctx.request_context.request.scope["aauth"]
+        document = resource.identity(
+            authorization,
+            edoc_id=requested_edoc_id,
+        )
+        executions["count"] += 1
+        return document["message"]
+
+    app = server.streamable_http_app(
+        authentication_middleware_factory=aauth_authorization(
+            key_resolver=resolver,
+            issuer=SENTINEL,
+            audience=RESOURCE,
+        )
+    )
+    url = "http://127.0.0.1:8000/mcp"
+    try:
+        async with server.session_manager.run():
+            async with (
+                httpx2.AsyncClient(
+                    transport=httpx2.ASGITransport(app=app),
+                    base_url=url,
+                    auth=AAuthAgentHTTPAuth(key=signing_key, token=token),
+                ) as http_client,
+                Client(
+                    streamable_http_client(url, http_client=http_client),
+                    mode="legacy",
+                ) as client,
+            ):
+                result = await client.call_tool(
+                    "identity",
+                    {"requested_edoc_id": edoc_id},
+                )
+        return result, None, executions["count"]
+    except BaseException as error:
+        return None, error, executions["count"]
 
 
 @pytest.mark.anyio
@@ -520,3 +589,75 @@ async def test_resource_token_endpoint_requires_signed_agent_request():
 
     assert response.status_code == 401
     assert response.json()["error"] == "invalid_signature"
+
+
+@pytest.mark.anyio
+async def test_mcp_rejects_invalid_authorization_envelopes_before_execution():
+    _, keys, _, _, resource, resolver, _ = world()
+    other_key = SigningKey.generate(kid="other-agent")
+    controller_token = final_token(
+        keys,
+        issuer=AS_A,
+        key=keys["as-a"],
+    )
+    wrong_audience = final_token(keys, aud="http://other-resource.local")
+    conditional = issue_conditional_auth_token(
+        issuer=AS_A,
+        aud=SENTINEL,
+        agent=AGENT,
+        cnf_jwk=keys["agent"].public_jwk,
+        scope=FUNCTION,
+        source_agent=SOURCE,
+        edoc_id=EDOC_ID,
+        controllers=(AS_A, AS_B),
+        prerequisite=Dataflow(SOURCE, "prepare@1", "doc-input", AGENT),
+        key=keys["as-a"],
+    )
+    cases = [
+        ("controller issuer", controller_token, keys["agent"]),
+        ("wrong audience", wrong_audience, keys["agent"]),
+        ("conditional token", conditional, keys["agent"]),
+        ("wrong proof key", final_token(keys), other_key),
+    ]
+
+    for label, token, signing_key in cases:
+        result, error, executions = await invoke_identity(
+            resource,
+            resolver,
+            signing_key,
+            token,
+        )
+        assert error is not None, label
+        assert result is None, label
+        assert executions == 0, label
+
+
+@pytest.mark.anyio
+async def test_mcp_rejects_dataflow_mismatches_before_execution():
+    _, keys, _, _, resource, resolver, _ = world()
+    cases = [
+        ("wrong eDoc", final_token(keys, edoc_id="doc-456"), EDOC_ID),
+        ("wrong function", final_token(keys, scope="other@1"), EDOC_ID),
+        (
+            "wrong source",
+            final_token(keys, source_agent="aauth:other-source@ap.local"),
+            EDOC_ID,
+        ),
+        (
+            "wrong destination",
+            final_token(keys, agent="aauth:other@ap.local"),
+            EDOC_ID,
+        ),
+    ]
+
+    for label, token, requested_edoc_id in cases:
+        result, error, executions = await invoke_identity(
+            resource,
+            resolver,
+            keys["agent"],
+            token,
+            edoc_id=requested_edoc_id,
+        )
+        assert error is None, label
+        assert result.is_error, label
+        assert executions == 0, label
