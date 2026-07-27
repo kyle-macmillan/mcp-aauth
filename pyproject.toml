@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "AAuth authentication integration for the MCP Python SDK"
 requires-python = ">=3.10"
 dependencies = [
-    "aauth-edocs",
+    "aauth-edocs[flask]",
     "httpx2>=2.5.0",
     "starlette>=0.27",
 ]
@@ -26,5 +26,5 @@ dev = [
 
 [tool.uv.sources]
 aauth-edocs = { path = "../aauth", editable = true }
-mcp = { path = "../python-sdk", editable = true }
-mcp-types = { path = "../python-sdk/src/mcp-types", editable = true }
+mcp = { path = "../mcp-python-sdk", editable = true }
+mcp-types = { path = "../mcp-python-sdk/src/mcp-types", editable = true }
