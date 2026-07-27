@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx2
@@ -7,6 +11,7 @@ import pytest
 from flask import Flask
 
 from aauth_edocs import (
+    AAuthError,
     ControllerPolicy,
     Dataflow,
     ExactRule,
@@ -15,24 +20,29 @@ from aauth_edocs import (
     ResourceBinding,
     SentinelRegistry,
     SigningKey,
+    VerifiedRequest,
     build_metadata,
     create_sentinel,
     issue_agent_token,
+    issue_resource_token,
     sign,
     static_resolver,
 )
 from aauth_edocs.agent import TransportResponse
 from aauth_edocs.asrv import create_as
+from aauth_edocs.errors import DENIED, INVALID_REQUEST, INVALID_TOKEN
+from aauth_edocs.httpsig import KeyResolver
+from aauth_edocs.keys import jwk_thumbprint
 from aauth_edocs.ps import create_ps
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from mcp_aauth import (
     AAuthAgentHTTPAuth,
-    EdocsResource,
-    EdocsResourceApplication,
+    aauth_agent_authentication,
     aauth_authorization,
 )
 
@@ -46,6 +56,145 @@ AGENT = "aauth:assistant@ap.local"
 SOURCE = "aauth:source@ap.local"
 EDOC_ID = "doc-123"
 FUNCTION = "identity@1"
+
+
+@dataclass(frozen=True)
+class DemoResource:
+    """Test application state, deliberately not part of mcp_aauth."""
+
+    issuer: str
+    sentinel: str
+    source_agent: str
+    key: SigningKey
+    controllers: tuple[str, ...]
+    documents: Mapping[str, Any]
+    functions: Mapping[str, FunctionDescriptor]
+
+    def proposed_dataflow_token(
+        self, verified_agent: VerifiedRequest, *, scope: str, edoc_id: str
+    ) -> str:
+        if not isinstance(scope, str) or len(scope.split()) != 1:
+            raise AAuthError(INVALID_REQUEST, 400, "exactly one function scope is required")
+        if scope not in self.functions:
+            raise AAuthError(DENIED, 403, "function is not registered")
+        if edoc_id not in self.documents:
+            raise AAuthError(DENIED, 403, "eDoc does not exist")
+        agent = verified_agent.claims.get("sub")
+        agent_jwk = (verified_agent.claims.get("cnf") or {}).get("jwk")
+        if not isinstance(agent, str) or not agent or not isinstance(agent_jwk, dict):
+            raise AAuthError(INVALID_TOKEN, 401, "verified agent identity is incomplete")
+        return issue_resource_token(
+            issuer=self.issuer,
+            aud=self.sentinel,
+            agent=agent,
+            agent_jkt=jwk_thumbprint(agent_jwk),
+            scope=scope,
+            source_agent=self.source_agent,
+            edoc_id=edoc_id,
+            controllers=self.controllers,
+            key=self.key,
+        )
+
+    def identity(self, authorization: VerifiedRequest, *, edoc_id: str) -> Any:
+        expected = {
+            "iss": self.sentinel,
+            "aud": self.issuer,
+            "source_agent": self.source_agent,
+            "scope": FUNCTION,
+            "edoc_id": edoc_id,
+            "controllers": list(self.controllers),
+        }
+        for name, value in expected.items():
+            if authorization.claims.get(name) != value:
+                raise AAuthError(
+                    INVALID_TOKEN,
+                    401,
+                    f"authorization {name} does not match the invocation",
+                )
+        if edoc_id not in self.documents:
+            raise AAuthError(DENIED, 403, "eDoc does not exist")
+        return self.documents[edoc_id]
+
+
+class DemoApplication:
+    """Test-only composition of a proposed-dataflow endpoint and MCP."""
+
+    def __init__(
+        self,
+        resource: DemoResource,
+        mcp_app: ASGIApp,
+        *,
+        key_resolver: KeyResolver,
+    ) -> None:
+        self.resource = resource
+        self.mcp_app = mcp_app
+        self.proposal_app = aauth_agent_authentication(
+            key_resolver=key_resolver
+        )(self._proposal)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("path") == "/resource-token":
+            await self.proposal_app(scope, receive, send)
+            return
+        await self.mcp_app(scope, receive, send)
+
+    async def _proposal(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("method") != "POST":
+            await send_json(send, 405, {"error": "method_not_allowed"})
+            return
+        try:
+            body = await read_json(receive)
+            if set(body) != {"scope", "edoc_id"}:
+                raise AAuthError(
+                    INVALID_REQUEST,
+                    400,
+                    "request must contain exactly scope and edoc_id",
+                )
+            token = self.resource.proposed_dataflow_token(
+                scope["aauth"],
+                scope=body["scope"],
+                edoc_id=body["edoc_id"],
+            )
+        except AAuthError as error:
+            await send_json(send, error.status, error.body())
+            return
+        except (TypeError, ValueError, json.JSONDecodeError):
+            await send_json(
+                send,
+                400,
+                {"error": INVALID_REQUEST, "detail": "JSON object required"},
+            )
+            return
+        await send_json(send, 200, {"resource_token": token})
+
+
+async def read_json(receive: Receive) -> dict:
+    chunks = []
+    while True:
+        message: Message = await receive()
+        if message["type"] == "http.request":
+            chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+    value = json.loads(b"".join(chunks))
+    if not isinstance(value, dict):
+        raise TypeError("JSON object required")
+    return value
+
+
+async def send_json(send: Send, status: int, value: dict) -> None:
+    body = json.dumps(value, separators=(",", ":")).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
 
 
 class LoopbackTransport:
@@ -168,7 +317,7 @@ def world(*, conditional: bool = False):
         ps=PS,
         key=keys["ap"],
     )
-    resource = EdocsResource(
+    resource = DemoResource(
         issuer=RESOURCE,
         sentinel=SENTINEL,
         source_agent=SOURCE,
@@ -189,7 +338,7 @@ def world(*, conditional: bool = False):
 async def proposed_resource_token_http(
     resource, resolver, keys, agent_token, downstream, body=None
 ):
-    app = EdocsResourceApplication(
+    app = DemoApplication(
         resource,
         downstream,
         key_resolver=resolver,
@@ -238,11 +387,7 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
     @server.tool()
     def identity(edoc_id: str, ctx: Context) -> str:
         authorization = ctx.request_context.request.scope["aauth"]
-        return resource.identity(
-            authorization,
-            edoc_id=edoc_id,
-            destination_agent=authorization.claims["agent"],
-        )["message"]
+        return resource.identity(authorization, edoc_id=edoc_id)["message"]
 
     mcp_app = server.streamable_http_app(
         authentication_middleware_factory=aauth_authorization(
@@ -251,7 +396,7 @@ async def test_full_aauth_edocs_mcp_authorization_flow():
             audience=RESOURCE,
         )
     )
-    app = EdocsResourceApplication(
+    app = DemoApplication(
         resource,
         mcp_app,
         key_resolver=resolver,
@@ -355,7 +500,7 @@ async def test_resource_token_endpoint_requires_signed_agent_request():
     async def downstream(scope, receive, send):
         raise AssertionError("MCP app should not be called")
 
-    app = EdocsResourceApplication(
+    app = DemoApplication(
         resource,
         downstream,
         key_resolver=resolver,
