@@ -456,10 +456,14 @@ async def test_missing_controller_prerequisite_denies_before_mcp():
         transport, keys, agent_token, resource_token
     )
 
-    denied = approve(transport, pending.headers["Location"])
+    recorded = approve(transport, pending.headers["Location"])
+    denied = transport.get(pending.headers["Location"])
 
+    assert recorded.status_code == 200
+    assert recorded.json() == {"status": "recorded"}
     assert denied.status_code == 403
     assert denied.json()["error"] == "denied"
+    assert "has not materialized" in denied.json()["detail"]
     assert proposal not in registry.materialized
 
 
