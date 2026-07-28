@@ -28,6 +28,7 @@ from aauth_edocs import (
     build_metadata,
     build_requirement,
     create_sentinel,
+    hash_function_args,
     issue_agent_token,
     issue_auth_token,
     issue_conditional_auth_token,
@@ -35,6 +36,7 @@ from aauth_edocs import (
     peek_jwt,
     sign,
     static_resolver,
+    validate_function_args,
 )
 from aauth_edocs.agent import TransportResponse
 from aauth_edocs.asrv import create_as
@@ -82,7 +84,12 @@ class DemoResource:
     functions: Mapping[str, FunctionDescriptor]
 
     def proposed_dataflow_token(
-        self, verified_agent: VerifiedRequest, *, scope: str, edoc_id: str
+        self,
+        verified_agent: VerifiedRequest,
+        *,
+        scope: str,
+        edoc_id: str,
+        function_args: Mapping[str, Any] | None = None,
     ) -> str:
         if not isinstance(scope, str) or len(scope.split()) != 1:
             raise AAuthError(INVALID_REQUEST, 400, "exactly one function scope is required")
@@ -90,6 +97,10 @@ class DemoResource:
             raise AAuthError(DENIED, 403, "function is not registered")
         if edoc_id not in self.documents:
             raise AAuthError(DENIED, 403, "eDoc does not exist")
+        try:
+            validate_function_args(self.functions[scope], function_args)
+        except ValueError as error:
+            raise AAuthError(INVALID_REQUEST, 400, str(error)) from error
         agent = verified_agent.claims.get("sub")
         agent_jwk = (verified_agent.claims.get("cnf") or {}).get("jwk")
         if not isinstance(agent, str) or not agent or not isinstance(agent_jwk, dict):
@@ -103,6 +114,7 @@ class DemoResource:
             source_agent=self.source_agent,
             edoc_id=edoc_id,
             controllers=self.controllers,
+            function_args=function_args,
             key=self.key,
         )
 
@@ -115,6 +127,7 @@ class DemoResource:
             "edoc_id": edoc_id,
             "agent": self.destination_agent,
             "controllers": list(self.controllers),
+            "function_args_hash": hash_function_args({}),
         }
         for name, value in expected.items():
             if authorization.claims.get(name) != value:
@@ -187,16 +200,20 @@ class DemoApplication:
             return
         try:
             body = await read_json(receive)
-            if set(body) != {"scope", "edoc_id"}:
+            if set(body) - {"scope", "edoc_id", "function_args"} or not {
+                "scope",
+                "edoc_id",
+            } <= set(body):
                 raise AAuthError(
                     INVALID_REQUEST,
                     400,
-                    "request must contain exactly scope and edoc_id",
+                    "request must contain scope, edoc_id, and optional function_args",
                 )
             token = self.resource.proposed_dataflow_token(
                 scope["aauth"],
                 scope=body["scope"],
                 edoc_id=body["edoc_id"],
+                function_args=body.get("function_args"),
             )
         except AAuthError as error:
             await send_json(send, error.status, error.body())
@@ -348,6 +365,7 @@ def world(*, conditional: bool = False):
             transport=transport,
             sentinel=SENTINEL,
             controller_policy=policy_a,
+            functions=registry.functions,
         ),
     )
     transport.add(
@@ -358,6 +376,7 @@ def world(*, conditional: bool = False):
             transport=transport,
             sentinel=SENTINEL,
             controller_policy=policy_b,
+            functions=registry.functions,
         ),
     )
     transport.add(
@@ -423,7 +442,8 @@ async def proposed_resource_token_http(
     ) as client:
         return await client.post(
             "/resource-token",
-            json=body or {"scope": FUNCTION, "edoc_id": EDOC_ID},
+            json=body
+            or {"scope": FUNCTION, "edoc_id": EDOC_ID, "function_args": {}},
         )
 
 
@@ -725,6 +745,14 @@ async def test_mcp_rejects_dataflow_mismatches_before_execution():
     cases = [
         ("wrong eDoc", final_token(keys, edoc_id="doc-456"), EDOC_ID),
         ("wrong function", final_token(keys, scope="other@1"), EDOC_ID),
+        (
+            "wrong function arguments",
+            final_token(
+                keys,
+                function_args_hash=hash_function_args({"query": "different"}),
+            ),
+            EDOC_ID,
+        ),
         (
             "wrong source",
             final_token(keys, source_agent="aauth:other-source@ap.local"),
