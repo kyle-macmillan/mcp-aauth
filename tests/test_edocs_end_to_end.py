@@ -36,7 +36,6 @@ from aauth_edocs import (
     peek_jwt,
     sign,
     static_resolver,
-    validate_function_args,
 )
 from aauth_edocs.agent import TransportResponse
 from aauth_edocs.asrv import create_as
@@ -97,10 +96,6 @@ class DemoResource:
             raise AAuthError(DENIED, 403, "function is not registered")
         if edoc_id not in self.documents:
             raise AAuthError(DENIED, 403, "eDoc does not exist")
-        try:
-            validate_function_args(self.functions[scope], function_args)
-        except ValueError as error:
-            raise AAuthError(INVALID_REQUEST, 400, str(error)) from error
         agent = verified_agent.claims.get("sub")
         agent_jwk = (verified_agent.claims.get("cnf") or {}).get("jwk")
         if not isinstance(agent, str) or not agent or not isinstance(agent_jwk, dict):
@@ -163,7 +158,10 @@ class DemoApplication:
         )(self._challenge)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope.get("path") == "/resource-token":
+        if scope["type"] == "http" and scope.get("path") in {
+            "/resource-token",
+            "/authorize",
+        }:
             await self.proposal_app(scope, receive, send)
             return
         if (
@@ -200,6 +198,12 @@ class DemoApplication:
             return
         try:
             body = await read_json(receive)
+            if set(body) == {"edoc_id", "function_id", "function_args"}:
+                body = {
+                    "scope": body["function_id"],
+                    "edoc_id": body["edoc_id"],
+                    "function_args": body["function_args"],
+                }
             if set(body) - {"scope", "edoc_id", "function_args"} or not {
                 "scope",
                 "edoc_id",
@@ -365,7 +369,6 @@ def world(*, conditional: bool = False):
             transport=transport,
             sentinel=SENTINEL,
             controller_policy=policy_a,
-            functions=registry.functions,
         ),
     )
     transport.add(
@@ -376,7 +379,6 @@ def world(*, conditional: bool = False):
             transport=transport,
             sentinel=SENTINEL,
             controller_policy=policy_b,
-            functions=registry.functions,
         ),
     )
     transport.add(
